@@ -1,4 +1,3 @@
-
 services:
   backend:
     build: ./backend
@@ -6,8 +5,14 @@ services:
       - "8000:8000"
     volumes:
       - ./backend:/app
+      - /var/run/docker.sock:/var/run/docker.sock
     environment:
       - ENV=development
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
 
   frontend:
     build: ./frontend
@@ -17,6 +22,11 @@ services:
       - ./frontend:/app
     environment:
       - ENV=development
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
 
   splunk:
     image: splunk/splunk:latest
@@ -29,4 +39,9 @@ services:
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000"]
       interval: 10s
+      timeout: 5s
       retries: 5
+
+  nmap:
+    build: ./tools/nmap
+    entrypoint: ["nmap", "--version"]
