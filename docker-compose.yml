@@ -8,6 +8,8 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock
     environment:
       - ENV=development
+      - SPLUNK_HEC_URL=${SPLUNK_HEC_URL}
+      - SPLUNK_HEC_TOKEN=${SPLUNK_HEC_TOKEN}
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/healthz"]
       interval: 10s
@@ -41,7 +43,14 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
+    volumes:
+      - splunk_etc:/opt/splunk/etc
+      - splunk_var:/opt/splunk/var
 
   nmap:
     build: ./tools/nmap
     entrypoint: ["nmap", "--version"]
+
+volumes:
+  splunk_etc:
+  splunk_var:
