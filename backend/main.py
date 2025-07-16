@@ -7,6 +7,8 @@ import uuid
 from transformers import nmap_to_unified
 import docker
 from utils import send_to_splunk
+from fastapi.middleware.cors import CORSMiddleware
+
 
 # Maximum number of scans that can run at the same time
 MAX_CONCURRENT_SCANS = 2
@@ -17,6 +19,14 @@ scan_results = {}      # Maps scan_id to result dict
 scan_status = {}       # Maps scan_id to status: 'queued', 'running', 'done', 'error'
 
 app = FastAPI()
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:3000"],  # React dev server origin
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 class ScanRequest(BaseModel):
     target: str
