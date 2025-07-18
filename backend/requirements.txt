@@ -1,6 +1,57 @@
-fastapi
-uvicorn
-docker
-requests
-python-dotenv
-starlette
+# Core FastAPI and async components
+fastapi==0.104.1
+uvicorn[standard]==0.24.0
+pydantic==2.5.0
+pydantic-settings==2.1.0
+
+# Database and ORM
+sqlalchemy[asyncio]==2.0.23
+asyncpg==0.29.0
+alembic==1.13.1
+psycopg2-binary==2.9.9
+
+# Redis and Celery for job processing
+redis==4.6.0
+celery[redis]==5.3.4
+flower==2.0.1
+
+# Authentication and security
+python-jose[cryptography]==3.3.0
+passlib[bcrypt]==1.7.4
+python-multipart==0.0.6
+PyJWT==2.8.0
+
+# HTTP client for external APIs
+httpx==0.25.2
+aiohttp==3.9.1
+
+# Observability
+opentelemetry-api==1.21.0
+opentelemetry-sdk==1.21.0
+opentelemetry-instrumentation-fastapi==0.42b0
+opentelemetry-instrumentation-sqlalchemy==0.42b0
+opentelemetry-exporter-jaeger==1.21.0
+sentry-sdk[fastapi]==1.38.0
+
+# Data processing and enrichment
+python-dateutil==2.8.2
+jsonschema==4.20.0
+cvss==2.6
+
+# External integrations
+docker==6.1.3
+splunk-sdk==1.7.4
+elasticsearch==8.11.0
+
+# Development and testing
+pytest==7.4.3
+pytest-asyncio==0.21.1
+pytest-cov==4.1.0
+black==23.11.0
+isort==5.12.0
+mypy==1.7.1
+
+# Environment and configuration
+python-dotenv==1.0.0
+requests==2.31.0
+starlette==0.27.0

@@ -1,56 +1,198 @@
+version: '3.8'
+
 services:
-  backend:
-    build: ./backend
-    ports:
-      - "8000:8000"
-    volumes:
-      - ./backend:/app
-      - /var/run/docker.sock:/var/run/docker.sock
+  # PostgreSQL with TimescaleDB
+  postgres:
+    image: timescale/timescaledb:2.14.2-pg16
     environment:
-      - ENV=development
-      - SPLUNK_HEC_URL=${SPLUNK_HEC_URL}
-      - SPLUNK_HEC_TOKEN=${SPLUNK_HEC_TOKEN}
+      POSTGRES_DB: secdash
+      POSTGRES_USER: secdash
+      POSTGRES_PASSWORD: secdash
+      POSTGRES_INITDB_ARGS: "--encoding=UTF-8 --lc-collate=C --lc-ctype=C"
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./scripts/init-timescaledb.sql:/docker-entrypoint-initdb.d/init-timescaledb.sql
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/healthz"]
+      test: ["CMD-SHELL", "pg_isready -U secdash -d secdash"]
       interval: 10s
       timeout: 5s
       retries: 5
+    networks:
+      - secdash
 
-  frontend:
-    build: ./frontend
+  # Redis for Celery and caching
+  redis:
+    image: redis:7.2.4-alpine
     ports:
-      - "3000:3000"
+      - "6379:6379"
     volumes:
-      - ./frontend:/app
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - secdash
+
+  # Keycloak for authentication
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.0.0
+    environment:
+      KEYCLOAK_ADMIN: admin
+      KEYCLOAK_ADMIN_PASSWORD: admin
+      KC_DB: postgres
+      KC_DB_URL: jdbc:postgresql://postgres:5432/keycloak
+      KC_DB_USERNAME: secdash
+      KC_DB_PASSWORD: secdash
+      KC_HOSTNAME: localhost
+      KC_HOSTNAME_PORT: 8080
+      KC_HTTP_ENABLED: true
+      KC_HOSTNAME_STRICT_HTTPS: false
+    ports:
+      - "8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    command: start-dev
+    volumes:
+      - ./config/keycloak:/opt/keycloak/data/import
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health/ready"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    networks:
+      - secdash
+
+  # FastAPI Backend
+  backend:
+    build: 
+      context: ./backend
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
     environment:
       - ENV=development
+      - DATABASE__URL=postgresql+asyncpg://secdash:secdash@postgres:5432/secdash
+      - REDIS__URL=redis://redis:6379/0
+      - REDIS__BROKER_URL=redis://redis:6379/1
+      - REDIS__RESULT_BACKEND=redis://redis:6379/2
+      - SECURITY__KEYCLOAK_SERVER_URL=http://keycloak:8080
+      - OBSERVABILITY__JAEGER_ENDPOINT=http://jaeger:14268/api/traces
+      - OBSERVABILITY__SENTRY_DSN=${SENTRY_DSN:-}
+      - DEBUG=true
+    volumes:
+      - ./backend:/app
+      - /var/run/docker.sock:/var/run/docker.sock
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - secdash
+
+  # Celery Worker
+  celery-worker:
+    build: 
+      context: ./backend
+      dockerfile: Dockerfile
+    command: python -m celery -A celery_app worker --loglevel=info --concurrency=4 --queues=scans,default
+    environment:
+      - ENV=development
+      - DATABASE__URL=postgresql+asyncpg://secdash:secdash@postgres:5432/secdash
+      - REDIS__BROKER_URL=redis://redis:6379/1
+      - REDIS__RESULT_BACKEND=redis://redis:6379/2
+      - SCANNERS__DOCKER_NETWORK=secdash_default
+    volumes:
+      - ./backend:/app
+      - /var/run/docker.sock:/var/run/docker.sock
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      backend:
+        condition: service_healthy
+    restart: unless-stopped
+    user: root
+    networks:
+      - secdash
+
+  # React Frontend
+  frontend:
+    build: 
+      context: ./frontend
+      dockerfile: Dockerfile
+    ports:
+      - "3000:3000"
+    environment:
+      - REACT_APP_API_URL=http://localhost:8000
+      - REACT_APP_KEYCLOAK_URL=http://localhost:8080
+      - REACT_APP_KEYCLOAK_REALM=secdash
+      - REACT_APP_KEYCLOAK_CLIENT_ID=secdash-frontend
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+    depends_on:
+      backend:
+        condition: service_healthy
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:3000"]
       interval: 10s
       timeout: 5s
       retries: 5
+    networks:
+      - secdash
 
-  splunk:
-    image: splunk/splunk:latest
-    environment:
-      - SPLUNK_START_ARGS=--accept-license
-      - SPLUNK_PASSWORD=changeme
+  # Jaeger for distributed tracing
+  jaeger:
+    image: jaegertracing/all-in-one:1.60.0
     ports:
-      - "8001:8000"
-      - "8088:8088"
+      - "16686:16686"
+      - "14268:14268"
+    environment:
+      - COLLECTOR_OTLP_ENABLED=true
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-    volumes:
-      - splunk_etc:/opt/splunk/etc
-      - splunk_var:/opt/splunk/var
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:16686"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    networks:
+      - secdash
 
-  nmap:
-    build: ./tools/nmap
-    entrypoint: ["nmap", "--version"]
+  # Flower for Celery monitoring
+  flower:
+    build: 
+      context: ./backend
+      dockerfile: Dockerfile
+    command: celery -A celery_app flower --port=5555
+    ports:
+      - "5555:5555"
+    environment:
+      - ENV=development
+      - REDIS__BROKER_URL=redis://redis:6379/1
+      - FLOWER_BASIC_AUTH=admin:admin
+    depends_on:
+      redis:
+        condition: service_healthy
+    networks:
+      - secdash
 
 volumes:
-  splunk_etc:
-  splunk_var:
+  postgres_data:
+  redis_data:
+  celery_beat:
+
+networks:
+  secdash:
+    driver: bridge
+    name: secdash_default

@@ -1,106 +1,171 @@
-import threading
-import queue
-import time
-from fastapi import FastAPI
-from pydantic import BaseModel
-import uuid
-from transformers import nmap_to_unified
-import docker
-from utils import send_to_splunk
+"""
+SecDash v2.0 - Modern FastAPI application with async SQLAlchemy and Celery
+"""
+from contextlib import asynccontextmanager
+
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.trustedhost import TrustedHostMiddleware
+from fastapi.responses import JSONResponse
+from fastapi.openapi.utils import get_openapi
+
+# Observability imports
+import sentry_sdk
+from sentry_sdk.integrations.fastapi import FastApiIntegration
+from sentry_sdk.integrations.sqlalchemy import SqlalchemyIntegration
+from opentelemetry import trace
+from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
+from opentelemetry.instrumentation.sqlalchemy import SQLAlchemyInstrumentor
+
+from config import settings
+from database import init_db, close_db
+from api.v1 import assets, scans, vulnerabilities, dashboard, profiles, health
+from middleware.auth import AuthenticationMiddleware
+from middleware.error_handling import ErrorHandlingMiddleware
 
 
-# Maximum number of scans that can run at the same time
-MAX_CONCURRENT_SCANS = 2
+# Initialize observability
+if settings.observability.sentry_dsn:
+    sentry_sdk.init(
+        dsn=settings.observability.sentry_dsn,
+        integrations=[
+            FastApiIntegration(auto_enabling_instrumentations=False),
+            SqlalchemyIntegration(),
+        ],
+        traces_sample_rate=0.1,
+        profiles_sample_rate=0.1,
+    )
 
-# Shared objects to track scan jobs and results
-scan_job_queue = queue.Queue()
-scan_results = {}      # Maps scan_id to result dict
-scan_status = {}       # Maps scan_id to status: 'queued', 'running', 'done', 'error'
+# Initialize OpenTelemetry
+tracer = trace.get_tracer(__name__)
 
-app = FastAPI()
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Application lifespan manager"""
+    # Startup
+    print("Starting SecDash v2.0...")
+    
+    # Initialize database
+    try:
+        await init_db()
+        print("Database initialized successfully")
+    except Exception as e:
+        print(f"Database initialization failed: {e}")
+        raise
+    
+    yield
+    
+    # Shutdown
+    print("Shutting down SecDash...")
+    await close_db()
+    print("Database connections closed")
+
+
+# Create FastAPI application
+app = FastAPI(
+    title=settings.app_name,
+    description="Modern Security Dashboard for Vulnerability Management",
+    version=settings.app_version,
+    docs_url="/docs" if settings.debug else None,
+    redoc_url="/redoc" if settings.debug else None,
+    openapi_url="/openapi.json" if settings.debug else None,
+    lifespan=lifespan,
+)
+
+# Add middleware
+app.add_middleware(
+    TrustedHostMiddleware,
+    allowed_hosts=settings.allowed_hosts,
+)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000"],  # React dev server origin
+    allow_origins=settings.cors_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-class ScanRequest(BaseModel):
-    target: str
+app.add_middleware(AuthenticationMiddleware)
+app.add_middleware(ErrorHandlingMiddleware)
 
-def scan_worker():
-    while True:
-        scan_id, target = scan_job_queue.get()
-        try:
-            scan_status[scan_id] = 'running'
-            print(f"Running Nmap scan for {target} (scan_id={scan_id})...")
-            client = docker.from_env()
-            command = f"nmap -Pn -p 80 {target}"
-            out = client.containers.run(
-                image="instrumentisto/nmap",
-                command=command,
-                remove=True,
-                stdout=True,
-                stderr=True
-            )
-            raw_output = out.decode()
-            print("Nmap scan finished, now parsing output...")
-            unified = nmap_to_unified(raw_output, scan_id, target)
-            scan_results[scan_id] = unified
-            scan_status[scan_id] = 'done'
-            print("Sending results to Splunk...")
-            code, resp = send_to_splunk(unified)
-            print(f"Splunk response: {code} {resp}")
-        except Exception as e:
-            scan_results[scan_id] = {'error': str(e)}
-            scan_status[scan_id] = 'error'
-        finally:
-            scan_job_queue.task_done()
+# Include API routers
+app.include_router(health.router, prefix="/health", tags=["Health"])
+app.include_router(assets.router, prefix=f"{settings.api_prefix}/assets", tags=["Assets"])
+app.include_router(scans.router, prefix=f"{settings.api_prefix}/scans", tags=["Scans"])
+app.include_router(vulnerabilities.router, prefix=f"{settings.api_prefix}/vulnerabilities", tags=["Vulnerabilities"])
+app.include_router(dashboard.router, prefix=f"{settings.api_prefix}/dashboard", tags=["Dashboard"])
+app.include_router(profiles.router, prefix=f"{settings.api_prefix}/profiles", tags=["Scan Profiles"])
+
+# Custom OpenAPI schema
+def custom_openapi():
+    if app.openapi_schema:
+        return app.openapi_schema
+    
+    openapi_schema = get_openapi(
+        title=app.title,
+        version=app.version,
+        description=app.description,
+        routes=app.routes,
+    )
+    
+    # Add security schemes
+    openapi_schema["components"]["securitySchemes"] = {
+        "BearerAuth": {
+            "type": "http",
+            "scheme": "bearer",
+            "bearerFormat": "JWT",
+        }
+    }
+    
+    # Add global security requirement
+    openapi_schema["security"] = [{"BearerAuth": []}]
+    
+    app.openapi_schema = openapi_schema
+    return app.openapi_schema
 
 
-# Start worker threads (will keep running in the background)
-for _ in range(MAX_CONCURRENT_SCANS):
-    t = threading.Thread(target=scan_worker, daemon=True)
-    t.start()
+app.openapi = custom_openapi
 
-@app.post("/scans")
-def start_scan(scan_req: ScanRequest):
-    """
-    Submits a new scan request.
-    Returns a scan_id and status message.
-    The actual scan will be picked up by the worker as soon as possible.
-    """
-    scan_id = str(uuid.uuid4())
-    scan_results[scan_id] = None
-    scan_status[scan_id] = 'queued'
-    scan_job_queue.put((scan_id, scan_req.target))
+# Initialize OpenTelemetry instrumentation
+if settings.observability.jaeger_endpoint:
+    FastAPIInstrumentor.instrument_app(app)
+    SQLAlchemyInstrumentor().instrument()
+
+
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request, exc):
+    """Custom HTTP exception handler"""
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={
+            "error": exc.detail,
+            "status_code": exc.status_code,
+            "timestamp": "2025-07-17T00:00:00Z"  # Use actual timestamp
+        }
+    )
+
+
+@app.get("/")
+async def root():
+    """Root endpoint"""
     return {
-        "scan_id": scan_id,
-        "status": scan_status[scan_id],
-        "message": "Scan submitted and queued. Use /scans/{scan_id} to check status and result."
+        "name": settings.app_name,
+        "version": settings.app_version,
+        "status": "running",
+        "docs_url": "/docs" if settings.debug else None,
     }
 
-@app.get("/scans/{scan_id}")
-def get_scan_status(scan_id: str):
-    """
-    Returns the current status and (if done) the result of the scan.
-    """
-    status = scan_status.get(scan_id)
-    result = scan_results.get(scan_id)
-    if status is None:
-        return {"error": "Scan ID not found"}
-    return {
-        "scan_id": scan_id,
-        "status": status,
-        "result": result
-    }
 
-@app.get("/healthz")
-def health_check():
-    """
-    Simple health check for Docker Compose.
-    """
-    return {"status": "ok"}
+if __name__ == "__main__":
+    import uvicorn
+    
+    uvicorn.run(
+        "main:app",
+        host="0.0.0.0",
+        port=8000,
+        reload=settings.debug,
+        log_level=settings.observability.log_level.lower(),
+        access_log=settings.debug,
+    )
